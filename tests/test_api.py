@@ -130,3 +130,193 @@ def test_pack_size_independent_of_image_size():
     import base64
     raw_len = len(base64.b64decode(token))
     assert raw_len < 4096
+
+
+# --------------------------------------------------------------------------- #
+# 质检员复核投票训练单（端到端）
+# --------------------------------------------------------------------------- #
+TRAIN_H, TRAIN_W = 8, 6
+
+
+def _training_pack():
+    # 通道 1 的 a=0：该通道不读像素，但训练梯度仍须对其 a、b 求导
+    return {
+        "a": [1.2, 0.0],
+        "b": [-0.5, 0.8],
+        "kernel": np.array(
+            [[[[0.5, -0.25, 0.0], [0.0, 1.0, 0.25], [0.5, 0.0, -0.5]],
+              [[0.0, 0.25, 0.0], [-0.5, 0.0, 0.75], [0.0, 0.0, 0.5]]],
+             [[[0.0, 0.0, 1.0], [-1.0, 0.5, 0.0], [0.0, 0.25, 0.0]],
+              [[0.75, 0.0, -0.25], [0.0, 1.0, 0.0], [-0.5, 0.25, 0.0]]]]
+        ).tolist(),
+        "bias": [0.3, -0.7],
+    }
+
+
+@pytest.fixture(scope="module")
+def job_created():
+    conv = client.post("/convert", json=_training_pack())
+    assert conv.status_code == 200, conv.text
+    pack_id = conv.json()["pack_id"]
+    rng = np.random.default_rng(7)
+    image = rng.uniform(-8, 8, (TRAIN_H, TRAIN_W, 2)).tolist()
+    r = client.post("/training-jobs",
+                    json={"pack_id": pack_id, "image": image})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["H"] == TRAIN_H and body["W"] == TRAIN_W
+    assert body["C"] == 2 and body["O"] == 2
+    return body["job_id"], image
+
+
+def _vote(r, c, o, label):
+    return {"r": r, "c": c, "o": o, "label": label}
+
+
+def test_create_job_rejects_oversized_image():
+    conv = client.post("/convert", json=_training_pack())
+    pack = conv.json()["pack"]
+    r = client.post("/training-jobs",
+                    json={"pack": pack, "image": np.zeros((65, 8, 2)).tolist()})
+    assert r.status_code == 422
+    r = client.post("/training-jobs",
+                    json={"pack": pack, "image": np.zeros((8, 65, 2)).tolist()})
+    assert r.status_code == 422
+
+
+def test_query_empty_job_prompts_relabel(job_created):
+    job_id, _ = job_created
+    r = client.post("/training-jobs/query", json={"job_id": job_id})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["has_effective_points"] is False and body["n_eff"] == 0
+    assert body["mse"] is None and body["grad_a"] is None and body["grad_b"] is None
+    assert "补标" in body["message"]
+
+
+def test_full_ticket_lifecycle_and_withdraw_changes_gradient(job_created):
+    job_id, image = job_created
+    img = np.asarray(image, dtype=np.float64)
+
+    # alice 投两张缺陷票、一张良品票
+    r = client.post("/training-jobs/ticket", json={
+        "job_id": job_id, "inspector": "alice", "ticket": [
+            _vote(0, 0, 0, "defect"), _vote(3, 2, 1, "defect"),
+            _vote(7, 5, 0, "good")]})
+    assert r.status_code == 200, r.text
+    assert r.json()["action"] == "submitted" and r.json()["ticket_size"] == 3
+    assert r.json()["points_touched"] == 3
+
+    q1 = client.post("/training-jobs/query", json={"job_id": job_id}).json()
+    assert q1["has_effective_points"] and q1["n_eff"] == 3
+    assert len(q1["grad_a"]) == 2 and len(q1["grad_b"]) == 2
+    # a=0 的通道 1 仍必须给出梯度
+    assert q1["grad_a"][1] is not None
+
+    # 与引擎直算结果逐值核对（目标：缺陷 +1、良品 -1）
+    from app import engine, pack as pack_mod
+    pack = pack_mod.build_pack(**_training_pack())
+    targets = {(0, 0, 0): 1, (3, 2, 1): 1, (7, 5, 0): -1}
+    stats = engine.training_stats_from_targets(pack, img, targets)
+    assert q1["mse"] == pytest.approx(stats["mse"], rel=1e-11, abs=1e-10)
+    np.testing.assert_allclose(q1["grad_a"], stats["grad_a"], rtol=1e-11, atol=1e-9)
+    np.testing.assert_allclose(q1["grad_b"], stats["grad_b"], rtol=1e-11, atol=1e-9)
+
+    # bob 对其中两点投反对票：(0,0,0) 平票失效，(3,2,1) 平票失效，剩 1 个有效点
+    r = client.post("/training-jobs/ticket", json={
+        "job_id": job_id, "inspector": "bob", "ticket": [
+            _vote(0, 0, 0, "good"), _vote(3, 2, 1, "good")]})
+    assert r.status_code == 200 and r.json()["points_touched"] == 2
+    q2 = client.post("/training-jobs/query", json={"job_id": job_id}).json()
+    assert q2["n_eff"] == 1
+    assert q2["mse"] != q1["mse"]  # 有效点集合变了，统计随之变化
+
+    # alice 撤票：仅剩 bob 的两张良品票，全部有效且目标为 -1
+    r = client.post("/training-jobs/ticket", json={
+        "job_id": job_id, "inspector": "alice", "ticket": []})
+    assert r.status_code == 200 and r.json()["action"] == "withdrawn"
+    q3 = client.post("/training-jobs/query", json={"job_id": job_id}).json()
+    assert q3["n_eff"] == 2
+    stats3 = engine.training_stats_from_targets(
+        pack, img, {(0, 0, 0): -1, (3, 2, 1): -1})
+    assert q3["mse"] == pytest.approx(stats3["mse"], rel=1e-11, abs=1e-10)
+    np.testing.assert_allclose(q3["grad_a"], stats3["grad_a"], rtol=1e-11, atol=1e-9)
+
+    # bob 也撤票：无有效点，恢复补标提示
+    client.post("/training-jobs/ticket", json={
+        "job_id": job_id, "inspector": "bob", "ticket": []})
+    q4 = client.post("/training-jobs/query", json={"job_id": job_id}).json()
+    assert q4["has_effective_points"] is False and "补标" in q4["message"]
+
+    detail = client.get(f"/training-jobs/{job_id}").json()
+    assert detail["inspectors"] == [] and detail["tickets"] == []
+
+
+def test_ticket_replacement_is_whole_document(job_created):
+    job_id, image = job_created
+    client.post("/training-jobs/ticket", json={
+        "job_id": job_id, "inspector": "carol", "ticket": [
+            _vote(1, 1, 0, "defect"), _vote(2, 2, 1, "good")]})
+    # 整份替换：旧票中未出现的点被删除
+    r = client.post("/training-jobs/ticket", json={
+        "job_id": job_id, "inspector": "carol", "ticket": [
+            _vote(1, 1, 0, "good")]})
+    assert r.status_code == 200 and r.json()["action"] == "replaced"
+    detail = client.get(f"/training-jobs/{job_id}").json()
+    carol = next(t for t in detail["tickets"] if t["inspector"] == "carol")
+    assert carol["ticket_size"] == 1
+    assert carol["ticket"][0] == _vote(1, 1, 0, "good")
+    client.post("/training-jobs/ticket", json={
+        "job_id": job_id, "inspector": "carol", "ticket": []})
+
+
+def test_invalid_votes_rejected_without_state_change(job_created):
+    job_id, _ = job_created
+    before = client.get(f"/training-jobs/{job_id}").json()
+    for bad in [
+        [_vote(TRAIN_H, 0, 0, "defect")],       # 行越界
+        [_vote(0, TRAIN_W, 0, "defect")],       # 列越界
+        [_vote(0, 0, 2, "defect")],             # 输出通道越界
+        [_vote(0, 0, 0, "maybe")],              # 非法标签
+        [_vote(0, 0, 0, "defect"),
+         _vote(0, 0, 0, "good")],               # 同人同点两票
+    ]:
+        r = client.post("/training-jobs/ticket", json={
+            "job_id": job_id, "inspector": "dave", "ticket": bad})
+        assert r.status_code == 422, r.text
+    after = client.get(f"/training-jobs/{job_id}").json()
+    assert after["tickets"] == before["tickets"]  # 失败不留痕
+
+
+def test_unknown_job_id_422():
+    assert client.post("/training-jobs/query",
+                       json={"job_id": "job_nope"}).status_code == 422
+    assert client.post("/training-jobs/ticket", json={
+        "job_id": "job_nope", "inspector": "x",
+        "ticket": []}).status_code == 422
+    assert client.get("/training-jobs/job_nope").status_code == 422
+
+
+def test_tie_points_excluded_and_majority_flips_target(job_created):
+    job_id, image = job_created
+    key_vote = _vote(4, 4, 0, "defect")
+    client.post("/training-jobs/ticket", json={
+        "job_id": job_id, "inspector": "e1", "ticket": [key_vote]})
+    q = client.post("/training-jobs/query", json={"job_id": job_id}).json()
+    assert q["n_eff"] == 1  # 缺陷 1:0 -> 目标 +1
+
+    client.post("/training-jobs/ticket", json={
+        "job_id": job_id, "inspector": "e2",
+        "ticket": [_vote(4, 4, 0, "good")]})
+    q = client.post("/training-jobs/query", json={"job_id": job_id}).json()
+    assert q["n_eff"] == 0  # 1:1 平票剔除
+
+    client.post("/training-jobs/ticket", json={
+        "job_id": job_id, "inspector": "e3",
+        "ticket": [_vote(4, 4, 0, "good")]})
+    q = client.post("/training-jobs/query", json={"job_id": job_id}).json()
+    assert q["n_eff"] == 1  # 良品 2:1 -> 目标 -1，重新有效
+
+    for name in ("e1", "e2", "e3"):
+        client.post("/training-jobs/ticket", json={
+            "job_id": job_id, "inspector": name, "ticket": []})

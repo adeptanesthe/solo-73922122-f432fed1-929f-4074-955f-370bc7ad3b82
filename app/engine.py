@@ -262,3 +262,107 @@ def reference_full_image(
     windows = np.lib.stride_tricks.sliding_window_view(y_pad, (3, 3), axis=(0, 1))
     # windows: (H, W, C, 3, 3) -> 与 K (O,C,3,3) 缩并
     return np.einsum("hwcuv,ocuv->hwo", windows, kernel) + bias[None, None, :]
+
+
+# --------------------------------------------------------------------------- #
+# 训练复核：输出点取值、对标准化参数 a/b 的导数（沿用整图补零规则）
+# --------------------------------------------------------------------------- #
+def point_value_and_grad(
+    pack: Mapping[str, np.ndarray],
+    image: np.ndarray,
+    p: int,
+    q: int,
+    o: int,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """计算单个输出点 (p, q, o) 的模型值及其对各输入通道 a、b 的导数。
+
+    严格沿用原模型：图内 tap 取 ``a*X+b``，图外 tap 落在补零圈按 0 处理，
+    因此图外 tap 对 a、b 的导数同样为 0（靠图内掩码自然排除）。
+
+    Returns
+    -------
+    (z, dz_da, dz_db)
+        z     : float，输出点值
+        dz_da : shape (C,)，``∂Z[p,q,o]/∂a[c] =
+                Σ_{图内 u,v} K[o,c,u,v] * X[p+u,q+v,c]``
+        dz_db : shape (C,)，``∂Z[p,q,o]/∂b[c] =
+                Σ_{图内 u,v} K[o,c,u,v]``
+    注意导数式本身不含 a，故 ``a[c]=0`` 的通道仍有非零导数，必须照常返回。
+    """
+    img = np.asarray(image, dtype=np.float64)
+    if img.ndim != 3:
+        raise EngineError(f"原图必须是 (H, W, C) 三维数组，收到形状 {img.shape}")
+    H, W, C = img.shape
+    if C != int(pack["C"]):
+        raise EngineError(f"原图通道数应为 {int(pack['C'])}，收到 {C}")
+    if not (0 <= p < H and 0 <= q < W):
+        raise EngineError(f"输出点坐标越界: (p={p}, q={q})，图尺寸 {H}x{W}")
+    O = int(pack["O"])
+    if not 0 <= o < O:
+        raise EngineError(f"输出通道 o={o} 越界，O={O}")
+
+    a = np.asarray(pack["a"], dtype=np.float64)
+    kernel = np.asarray(pack["K"], dtype=np.float64)
+    bias = np.asarray(pack["bias"], dtype=np.float64)
+
+    z = float(bias[o])
+    dz_da = np.zeros(C, dtype=np.float64)
+    dz_db = np.zeros(C, dtype=np.float64)
+    for ui, (u, v) in enumerate(TAP_OFFSETS):
+        sr, sc = p + u, q + v
+        if not (0 <= sr < H and 0 <= sc < W):
+            continue  # 补零圈：Y_pad=0，对值与 a/b 导数均无贡献
+        ku = kernel[o, :, ui // 3, ui % 3]          # (C,)
+        x_src = img[sr, sc, :]                       # (C,)
+        # 值：Σ_c K[o,c,u,v] * (a[c]*X + b[c])
+        z += float(np.sum(ku * (a * x_src + np.asarray(pack["b"], dtype=np.float64))))
+        dz_da += ku * x_src
+        dz_db += ku
+    return z, dz_da, dz_db
+
+
+def training_stats_from_targets(
+    pack: Mapping[str, np.ndarray],
+    image: np.ndarray,
+    targets: Mapping[Tuple[int, int, int], int],
+) -> Dict[str, object]:
+    """按有效点目标分全量重算训练统计（增量维护的对照基准）。
+
+    targets: ``{(p, q, o): +1/-1}``，仅含有效点（平票/无票点不在字典内）。
+
+    损失定义（N 为有效点数）::
+
+        L = (1/N) * Σ_{(p,q,o)} (Z[p,q,o] - target)^2
+        ∂L/∂a[c] = (2/N) * Σ (Z-target) * ∂Z/∂a[c]
+        ∂L/∂b[c] = (2/N) * Σ (Z-target) * ∂Z/∂b[c]
+    """
+    img = np.asarray(image, dtype=np.float64)
+    C = int(pack["C"])
+    n_eff = len(targets)
+    if n_eff == 0:
+        return {
+            "n_eff": 0,
+            "mse": None,
+            "grad_a": np.zeros(C, dtype=np.float64),
+            "grad_b": np.zeros(C, dtype=np.float64),
+            "se_sum": 0.0,
+        }
+    se_sum = 0.0
+    ga_sum = np.zeros(C, dtype=np.float64)
+    gb_sum = np.zeros(C, dtype=np.float64)
+    for (p, q, o), target in targets.items():
+        z, dza, dzb = point_value_and_grad(pack, img, p, q, o)
+        resid = z - float(target)
+        se_sum += resid * resid
+        ga_sum += resid * dza
+        gb_sum += resid * dzb
+    n = float(n_eff)
+    return {
+        "n_eff": n_eff,
+        "mse": se_sum / n,
+        "grad_a": (2.0 / n) * ga_sum,
+        "grad_b": (2.0 / n) * gb_sum,
+        "se_sum": se_sum,
+        "ga_sum": ga_sum,
+        "gb_sum": gb_sum,
+    }

@@ -171,3 +171,104 @@ class ReferenceRequest(_PackRef):
 class ReferenceResponse(BaseModel):
     shape: List[int]
     output: List[List[List[float]]]
+
+
+# --------------------------------------------------------------------------- #
+# 质检员复核投票训练单
+# --------------------------------------------------------------------------- #
+MAX_SIDE = 64
+
+
+class JobCreateRequest(_PackRef):
+    """开单：现有卷积参数包 + 一张原始图（宽、高各至多 64 像素）。"""
+
+    image: List[List[List[float]]] = Field(
+        ..., description="原始图 (H, W, C)，H、W 均在 1..64 之间，像素绝对值 <= 16"
+    )
+
+    @field_validator("image")
+    @classmethod
+    def _check_image(cls, v):
+        arr = np.asarray(v, dtype=np.float64)
+        if arr.ndim != 3:
+            raise ValueError("image 形状必须为 (H, W, C)")
+        H, W, C = arr.shape
+        if not 1 <= H <= MAX_SIDE or not 1 <= W <= MAX_SIDE:
+            raise ValueError(f"原图高、宽必须在 1..{MAX_SIDE} 之间，收到 {H}x{W}")
+        if not 1 <= C <= MAX_CHANNELS:
+            raise ValueError(f"通道数必须在 1..{MAX_CHANNELS} 之间")
+        if np.any(np.abs(arr) > MAX_ABS):
+            raise ValueError(f"像素存在绝对值超过 {MAX_ABS:g} 的值")
+        return v
+
+
+class JobCreateResponse(BaseModel):
+    job_id: str
+    H: int
+    W: int
+    C: int
+    O: int
+    message: str
+
+
+class VoteItem(BaseModel):
+    """单条票：输出点 (r, c, o) 与标签（defect=缺陷 / good=良品）。"""
+
+    r: int = Field(..., ge=0, description="输出点行")
+    c: int = Field(..., ge=0, description="输出点列")
+    o: int = Field(..., ge=0, description="输出通道")
+    label: str = Field(..., description="defect=缺陷票，good=良品票")
+
+
+class TicketRequest(BaseModel):
+    """整份提交/替换某质检员的票；ticket 为空数组即撤回。"""
+
+    job_id: str
+    inspector: str = Field(..., min_length=1, max_length=64)
+    ticket: List[VoteItem] = Field(
+        ..., description="该质检员本次的整份票；空数组表示撤回自己的全部票"
+    )
+
+
+class TicketResponse(BaseModel):
+    job_id: str
+    inspector: str
+    action: str = Field(..., description="submitted / replaced / withdrawn")
+    ticket_size: int
+    points_touched: int
+    n_eff: int
+
+
+class JobQueryRequest(BaseModel):
+    job_id: str
+
+
+class JobQueryResponse(BaseModel):
+    job_id: str
+    has_effective_points: bool
+    n_eff: int
+    mse: Optional[float] = None
+    grad_a: Optional[List[float]] = Field(
+        None, description="各输入通道 a 的梯度 ∂L/∂a；无有效点时为 null"
+    )
+    grad_b: Optional[List[float]] = Field(
+        None, description="各输入通道 b 的梯度 ∂L/∂b；无有效点时为 null"
+    )
+    message: str
+
+
+class JobTicket(BaseModel):
+    inspector: str
+    ticket: List[VoteItem]
+    ticket_size: int
+
+
+class JobDetailResponse(BaseModel):
+    job_id: str
+    H: int
+    W: int
+    C: int
+    O: int
+    n_eff: int
+    inspectors: List[str]
+    tickets: List[JobTicket]
